@@ -23,6 +23,7 @@ import org.mark.llamacpp.lmstudio.LMStudio;
 import org.mark.llamacpp.ollama.Ollama;
 import org.mark.llamacpp.server.channel.BasicRouterHandler;
 import org.mark.llamacpp.server.channel.CompletionRouterHandler;
+import org.mark.llamacpp.server.channel.DiskBackedHttpObjectAggregator;
 import org.mark.llamacpp.server.channel.FileDownloadRouterHandler;
 import org.apache.logging.log4j.LogManager;
 import org.mark.file.downloader.DownloadTaskManager;
@@ -68,7 +69,6 @@ import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaders;
-import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpServerCodec;
@@ -356,7 +356,8 @@ public class LlamaServer {
 	 */
 	private static final int DEFAULT_WEB_PORT = 8080;
 	
-	private static final int MAX_HTTP_CONTENT_LENGTH = 16 * 1024 * 1024;
+	private static final int MAX_HTTP_CONTENT_LENGTH = 256 * 1024 * 1024;
+	private static final int HTTP_AGGREGATE_MEMORY_THRESHOLD = 16 * 1024 * 1024;
 	
 	private static final int DEFAULT_MCP_SERVER_PORT = 8075;
 
@@ -1054,7 +1055,7 @@ public class LlamaServer {
                                         .addLast(new HttpServerCodec())
                                 		.addLast(new OpenAIChatStreamingHandler())
                                 		.addLast(new FileUploadRouterHandler())
-                                		.addLast(new HttpObjectAggregator(MAX_HTTP_CONTENT_LENGTH))
+                                		.addLast(new DiskBackedHttpObjectAggregator(MAX_HTTP_CONTENT_LENGTH, HTTP_AGGREGATE_MEMORY_THRESHOLD))
                                 		.addLast(new ChunkedWriteHandler())
                                 		.addLast(new WebSocketServerProtocolHandler(WEBSOCKET_PATH, null, true, 32768))
                                  		.addLast(new WebSocketServerHandler())
@@ -1068,7 +1069,7 @@ public class LlamaServer {
                                         .addLast(new HttpServerCodec())
                                         .addLast(new OpenAIChatStreamingHandler())
                                  		.addLast(new FileUploadRouterHandler())
-                                 		.addLast(new HttpObjectAggregator(MAX_HTTP_CONTENT_LENGTH))
+                                 		.addLast(new DiskBackedHttpObjectAggregator(MAX_HTTP_CONTENT_LENGTH, HTTP_AGGREGATE_MEMORY_THRESHOLD))
                                         .addLast(new ChunkedWriteHandler())
                                         .addLast(new WebSocketServerProtocolHandler(WEBSOCKET_PATH, null, true, 32768))
                                         .addLast(new WebSocketServerHandler())

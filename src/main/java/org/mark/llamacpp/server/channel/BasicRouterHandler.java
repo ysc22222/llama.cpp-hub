@@ -107,7 +107,11 @@ public class BasicRouterHandler extends SimpleChannelInboundHandler<FullHttpRequ
 		}
 		// 3.
 		if(LlamaServer.logRequestBody) {
-			logger.info("DEBUG - 请求体：{}", request.content().toString(CharsetUtil.UTF_8));
+			if (request instanceof DiskBackedHttpRequest diskBackedRequest && diskBackedRequest.isBodyOnDisk()) {
+				logger.info("DEBUG - 请求体已落盘：size={} bytes, path={}", diskBackedRequest.bodyLength(), diskBackedRequest.bodyPath());
+			} else {
+				logger.info("DEBUG - 请求体：{}", request.content().toString(CharsetUtil.UTF_8));
+			}
 		}
 		
 		// 傻逼浏览器不知道为什么一直在他妈的访问/.well-known/appspecific/com.chrome.devtools.json
