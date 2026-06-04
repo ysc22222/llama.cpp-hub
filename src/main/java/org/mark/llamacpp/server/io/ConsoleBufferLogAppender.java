@@ -1,7 +1,9 @@
 package org.mark.llamacpp.server.io;
 
 import java.io.Serializable;
-import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.Filter;
@@ -19,6 +21,9 @@ public class ConsoleBufferLogAppender extends AbstractAppender {
     private static final String APPENDER_NAME = "ConsoleBufferLogAppender";
     private static final String DEFAULT_LOG_PATTERN = "%d{yyyy-MM-dd HH:mm:ss.SSS} - %msg%n";
     private static final String RAW_PROCESS_LOGGER_NAME = "LLAMA_CPP_RAW";
+    private static final int MAX_CONSOLE_LINE_CHARS = 8192;
+    private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+            .withZone(ZoneId.systemDefault());
 
     protected ConsoleBufferLogAppender(String name, Filter filter, Layout<? extends Serializable> layout) {
         super(name, filter, layout, true, null);
@@ -33,12 +38,40 @@ public class ConsoleBufferLogAppender extends AbstractAppender {
         if ("STDOUT".equals(loggerName) || "STDERR".equals(loggerName) || RAW_PROCESS_LOGGER_NAME.equals(loggerName)) {
             return;
         }
-        byte[] bytes = getLayout().toByteArray(event.toImmutable());
-        String line = new String(bytes, StandardCharsets.UTF_8);
-        line = stripTrailingLineBreaks(line);
+        String line = this.buildConsoleLine(event);
         if (!line.isEmpty()) {
             LlamaServer.sendConsoleLineEvent(null, line);
         }
+    }
+
+    private String buildConsoleLine(LogEvent event) {
+        String message = "";
+        if (event.getMessage() != null) {
+            try {
+                message = event.getMessage().getFormattedMessage();
+            } catch (Exception ignore) {
+                message = String.valueOf(event.getMessage());
+            }
+        }
+        if (message == null) {
+            message = "";
+        }
+
+        Throwable thrown = event.getThrown();
+        if (thrown != null && thrown.getMessage() != null && !thrown.getMessage().isBlank()) {
+            if (!message.isEmpty()) {
+                message += " | ";
+            }
+            message += thrown.getClass().getSimpleName() + ": " + thrown.getMessage();
+        }
+
+        message = stripTrailingLineBreaks(message);
+        if (message.length() > MAX_CONSOLE_LINE_CHARS) {
+            message = message.substring(0, MAX_CONSOLE_LINE_CHARS) + "... [truncated]";
+        }
+
+        String timestamp = TIME_FORMATTER.format(Instant.ofEpochMilli(event.getTimeMillis()));
+        return timestamp + " - " + message;
     }
 
     private static String stripTrailingLineBreaks(String text) {

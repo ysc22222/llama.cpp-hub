@@ -44,6 +44,7 @@ import io.netty.util.ReferenceCountUtil;
 public class BasicRouterHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
 
 	private static final Logger logger = LoggerFactory.getLogger(BasicRouterHandler.class);
+	private static final int REQUEST_BODY_LOG_PREVIEW_CHARS = 4096;
 
 	private static final ExecutorService async = Executors.newVirtualThreadPerTaskExecutor();
 	
@@ -110,7 +111,7 @@ public class BasicRouterHandler extends SimpleChannelInboundHandler<FullHttpRequ
 			if (request instanceof DiskBackedHttpRequest diskBackedRequest && diskBackedRequest.isBodyOnDisk()) {
 				logger.info("DEBUG - 请求体已落盘：size={} bytes, path={}", diskBackedRequest.bodyLength(), diskBackedRequest.bodyPath());
 			} else {
-				logger.info("DEBUG - 请求体：{}", request.content().toString(CharsetUtil.UTF_8));
+				logger.info("DEBUG - 请求体：{}", this.buildRequestBodyLogPreview(request));
 			}
 		}
 		
@@ -176,6 +177,22 @@ public class BasicRouterHandler extends SimpleChannelInboundHandler<FullHttpRequ
 			logger.info("处理静态文件请求时发生错误", e);
 			LlamaServer.sendErrorResponse(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, "服务器内部错误");
 		}
+	}
+
+	private String buildRequestBodyLogPreview(FullHttpRequest request) {
+		if (request == null || request.content() == null) {
+			return "<empty>";
+		}
+		int readableBytes = request.content().readableBytes();
+		if (readableBytes <= 0) {
+			return "<empty>";
+		}
+		int previewLength = Math.min(readableBytes, REQUEST_BODY_LOG_PREVIEW_CHARS);
+		String preview = request.content().toString(request.content().readerIndex(), previewLength, CharsetUtil.UTF_8);
+		if (readableBytes > previewLength) {
+			return String.format("[truncated, total=%d bytes, preview=%d chars] %s", readableBytes, previewLength, preview);
+		}
+		return preview;
 	}
 
 	private boolean isMobileRequest(FullHttpRequest request) {
