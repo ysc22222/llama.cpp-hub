@@ -18,6 +18,7 @@ import org.mark.llamacpp.server.LlamaServerManager;
 import org.mark.llamacpp.server.NodeManager;
 import org.mark.llamacpp.server.struct.ActiveRequest.Phase;
 import org.mark.llamacpp.server.struct.Timing;
+import org.mark.llamacpp.server.tools.HttpRequestBodyHandle;
 import org.mark.llamacpp.server.tools.JsonUtil;
 import org.mark.llamacpp.server.tools.ParamTool;
 import org.slf4j.Logger;
@@ -33,6 +34,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.util.LinkedHashMap;
 import java.util.HashSet;
 import java.util.HashMap;
 import java.util.List;
@@ -62,6 +64,7 @@ public class AnthropicService {
 	 * 	线程池。
 	 */
 	private static final ExecutorService worker = Executors.newVirtualThreadPerTaskExecutor();
+	private final AnthropicTopLevelIndexer topLevelIndexer = new AnthropicTopLevelIndexer();
     
 	/**
 	 * 	存储当前通道正在处理的模型链接，用于在连接关闭时停止对应的模型进程
@@ -233,83 +236,41 @@ public class AnthropicService {
             return;
         }
 
-        String content = request.content().toString(CharsetUtil.UTF_8);
-        JsonObject anthropicReq;
+        HttpRequestBodyHandle bodyHandle;
         try {
-            anthropicReq = gson.fromJson(content, JsonObject.class);
-        } catch (Exception e) {
+            bodyHandle = HttpRequestBodyHandle.capture(request);
+        } catch (IOException e) {
+        	this.sendError(ctx, HttpResponseStatus.BAD_REQUEST, "Failed to capture request body");
+            return;
+        }
+
+        try {
+            AnthropicTopLevelIndexer.IndexResult index = this.readAnthropicTopLevelIndex(bodyHandle);
+            String nodeId = index.getNodeId();
+            String requestedModelName = index.getModel();
+            boolean isStream = index.getStream() != null ? index.getStream().booleanValue() : false;
+            LlamaServerManager manager = LlamaServerManager.getInstance();
+            String localModelName = this.resolveLocalAnthropicModel(requestedModelName, manager);
+
+            if ((nodeId == null || nodeId.isBlank()) && localModelName != null) {
+                Integer port = manager.getModelPort(localModelName);
+                if (port == null) {
+                    bodyHandle.close();
+                    this.sendError(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, "Model port not found for " + localModelName);
+                    return;
+                }
+                Map<String, JsonElement> overrides = this.buildNativeAnthropicOverrides(localModelName, bodyHandle, index);
+                AnthropicRequestSpliceWriter spliceWriter = new AnthropicRequestSpliceWriter(bodyHandle, index);
+                this.forwardRequestToLlamaCpp(ctx, request.method(), request.headers(), bodyHandle, port, "/v1/messages", isStream, localModelName,
+                        outputStream -> spliceWriter.write(outputStream, overrides, Set.of("nodeId", "enable_thinking")));
+                return;
+            }
+
+            this.handleMessagesLegacy(ctx, request, bodyHandle, index);
+        } catch (IOException e) {
+        	bodyHandle.close();
         	this.sendError(ctx, HttpResponseStatus.BAD_REQUEST, "Invalid JSON body");
-            return;
         }
-        JsonObject oaiReq = this.convertAnthropicToOai(anthropicReq);
-        // 处理一下think
-        ParamTool.handleThinking(oaiReq);
-        //
-        ChatTemplateKwargsService.getInstance().handleOpenAI(oaiReq);
-        // 处理采样覆盖
-        ModelSamplingService.getInstance().handleOpenAI(oaiReq);
-        
-        String nodeId = JsonUtil.getJsonString(anthropicReq, "nodeId", null);
-        LlamaServerManager manager = LlamaServerManager.getInstance();
-
-        if (nodeId != null && !nodeId.isBlank()) {
-            oaiReq.remove("nodeId");
-            this.routeMessagesToNode(ctx, request, oaiReq, nodeId);
-            return;
-        }
-
-        String modelName;
-        if (oaiReq.has("model")) {
-            modelName = oaiReq.get("model").getAsString();
-        } else {
-            modelName = manager.getFirstModelName();
-            if (modelName == null) {
-                this.sendError(ctx, HttpResponseStatus.NOT_FOUND, "No models loaded");
-                return;
-            }
-        }
-
-        boolean isStream = false;
-        if (oaiReq.has("stream") && oaiReq.get("stream").isJsonPrimitive()) {
-            try {
-                isStream = oaiReq.get("stream").getAsBoolean();
-            } catch (Exception ignore) {}
-        }
-
-        if (!manager.getLoadedProcesses().containsKey(modelName)) {
-            String resolved = manager.findModelIdByAlias(modelName);
-            if (resolved != null) {
-                modelName = resolved;
-            }
-        }
-        if (manager.getLoadedProcesses().containsKey(modelName)) {
-            Integer port = manager.getModelPort(modelName);
-            if (port == null) {
-                this.sendError(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, "Model port not found for " + modelName);
-                return;
-            }
-            String targetUrl = String.format("http://localhost:%d/v1/chat/completions", port.intValue());
-            this.forwardMessagesToChatCompletions(ctx, request, JsonUtil.toJson(oaiReq), targetUrl, null, isStream, modelName);
-            return;
-        }
-
-        if (manager.getLoadedProcesses().size() == 1) {
-            modelName = manager.getFirstModelName();
-            Integer port = manager.getModelPort(modelName);
-            if (port != null) {
-                String targetUrl = String.format("http://localhost:%d/v1/chat/completions", port.intValue());
-                this.forwardMessagesToChatCompletions(ctx, request, JsonUtil.toJson(oaiReq), targetUrl, null, isStream, modelName);
-                return;
-            }
-        }
-
-        String[] remoteResult = resolveModelOnRemoteNodes(modelName);
-        if (remoteResult != null) {
-            this.forwardMessagesToChatCompletions(ctx, request, JsonUtil.toJson(oaiReq), remoteResult[0], remoteResult[1], isStream, modelName);
-            return;
-        }
-
-        this.sendError(ctx, HttpResponseStatus.NOT_FOUND, "Model not found: " + modelName);
     }
     
     
@@ -329,50 +290,58 @@ public class AnthropicService {
             return;
         }
 
-        String content = request.content().toString(CharsetUtil.UTF_8);
-        JsonObject anthropicReq;
+        HttpRequestBodyHandle bodyHandle;
         try {
-            anthropicReq = gson.fromJson(content, JsonObject.class);
-        } catch (Exception e) {
-        	this.sendError(ctx, HttpResponseStatus.BAD_REQUEST, "Invalid JSON body");
+            bodyHandle = HttpRequestBodyHandle.capture(request);
+        } catch (IOException e) {
+        	this.sendError(ctx, HttpResponseStatus.BAD_REQUEST, "Failed to capture request body");
             return;
         }
 
-        String modelName;
-        LlamaServerManager manager = LlamaServerManager.getInstance();
+        try {
+            AnthropicTopLevelIndexer.IndexResult index = this.readAnthropicTopLevelIndex(bodyHandle);
+            String modelName;
+            LlamaServerManager manager = LlamaServerManager.getInstance();
 
-        if (anthropicReq.has("model")) {
-            modelName = anthropicReq.get("model").getAsString();
-        } else {
-            modelName = manager.getFirstModelName();
-            if (modelName == null) {
-            	this.sendError(ctx, HttpResponseStatus.NOT_FOUND, "No models loaded");
-                return;
-            }
-        }
-
-        if (!manager.getLoadedProcesses().containsKey(modelName)) {
-            String resolved = manager.findModelIdByAlias(modelName);
-            if (resolved != null) {
-                modelName = resolved;
-            }
-        }
-        if (!manager.getLoadedProcesses().containsKey(modelName)) {
-            if (manager.getLoadedProcesses().size() == 1) {
-                modelName = manager.getFirstModelName();
+            if (index.getModel() != null && !index.getModel().isBlank()) {
+                modelName = index.getModel();
             } else {
-            	this.sendError(ctx, HttpResponseStatus.NOT_FOUND, "Model not found: " + modelName);
+                modelName = manager.getFirstModelName();
+                if (modelName == null) {
+                	bodyHandle.close();
+                	this.sendError(ctx, HttpResponseStatus.NOT_FOUND, "No models loaded");
+                    return;
+                }
+            }
+
+            if (!manager.getLoadedProcesses().containsKey(modelName)) {
+                String resolved = manager.findModelIdByAlias(modelName);
+                if (resolved != null) {
+                    modelName = resolved;
+                }
+            }
+            if (!manager.getLoadedProcesses().containsKey(modelName)) {
+                if (manager.getLoadedProcesses().size() == 1) {
+                    modelName = manager.getFirstModelName();
+                } else {
+                	bodyHandle.close();
+                	this.sendError(ctx, HttpResponseStatus.NOT_FOUND, "Model not found: " + modelName);
+                    return;
+                }
+            }
+
+            Integer port = manager.getModelPort(modelName);
+            if (port == null) {
+            	bodyHandle.close();
+            	this.sendError(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, "Model port not found for " + modelName);
                 return;
             }
-        }
 
-        Integer port = manager.getModelPort(modelName);
-        if (port == null) {
-        	this.sendError(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, "Model port not found for " + modelName);
-            return;
+            this.forwardRequestToLlamaCpp(ctx, request.method(), request.headers(), bodyHandle, port, "/v1/messages/count_tokens", false, modelName);
+        } catch (IOException e) {
+        	bodyHandle.close();
+        	this.sendError(ctx, HttpResponseStatus.BAD_REQUEST, "Invalid JSON body");
         }
-
-        forwardRequestToLlamaCpp(ctx, request, content, port, "/v1/messages/count_tokens", false, modelName);
     }
     
     
@@ -453,6 +422,319 @@ public class AnthropicService {
                 }
             }
         });
+    }
+
+    private void forwardRequestToLlamaCpp(ChannelHandlerContext ctx, HttpMethod method, HttpHeaders requestHeaders, HttpRequestBodyHandle bodyHandle, int port, String endpoint, boolean isStream, String modelName) {
+        this.forwardRequestToLlamaCpp(ctx, method, requestHeaders, bodyHandle, port, endpoint, isStream, modelName, outputStream -> {
+            try (java.io.InputStream is = bodyHandle.openInputStream()) {
+                is.transferTo(outputStream);
+            }
+        });
+    }
+
+    private void forwardRequestToLlamaCpp(ChannelHandlerContext ctx, HttpMethod method, HttpHeaders requestHeaders, HttpRequestBodyHandle bodyHandle, int port, String endpoint, boolean isStream, String modelName, RequestBodyWriter requestBodyWriter) {
+        Map<String, String> headers = new HashMap<>();
+        for (Map.Entry<String, String> entry : requestHeaders) {
+            headers.put(entry.getKey(), entry.getValue());
+        }
+
+        worker.execute(() -> {
+            HttpURLConnection connection = null;
+            String requestId = null;
+            try {
+                if (modelName != null) {
+                    requestId = ModelRequestTracker.getInstance().createRequest(modelName, endpoint);
+                }
+                String targetUrl = String.format("http://localhost:%d%s", port, endpoint);
+                URL url = URI.create(targetUrl).toURL();
+                connection = (HttpURLConnection) url.openConnection();
+
+                synchronized (this.channelConnectionMap) {
+                    this.channelConnectionMap.put(ctx, connection);
+                }
+
+                connection.setRequestMethod(method.name());
+                for (Map.Entry<String, String> entry : headers.entrySet()) {
+                    if (!entry.getKey().equalsIgnoreCase("Connection") &&
+                        !entry.getKey().equalsIgnoreCase("Content-Length") &&
+                        !entry.getKey().equalsIgnoreCase("Transfer-Encoding")) {
+                        connection.setRequestProperty(entry.getKey(), entry.getValue());
+                    }
+                }
+
+                connection.setConnectTimeout(36000 * 1000);
+                connection.setReadTimeout(36000 * 1000);
+
+                if (method == HttpMethod.POST) {
+                    connection.setDoOutput(true);
+                    try (OutputStream os = connection.getOutputStream()) {
+                        requestBodyWriter.write(os);
+                    }
+                }
+
+                long t = System.currentTimeMillis();
+                int responseCode = connection.getResponseCode();
+                if (requestId != null) ModelRequestTracker.getInstance().updatePhase(requestId, Phase.GENERATION);
+
+                if (isStream) {
+                	logger.info("llama.cpp进程响应码: {}，，等待时间：{}", responseCode, System.currentTimeMillis() - t);
+                	this.handleStreamResponse(ctx, connection, responseCode, requestId, modelName);
+                } else {
+                	this.handleNonStreamResponse(ctx, connection, responseCode, requestId, modelName);
+                }
+            } catch (Exception e) {
+                logger.info("Error forwarding Anthropic request to llama.cpp", e);
+                this.sendError(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, e.getMessage());
+            } catch (Throwable t) {
+                logger.error("虚拟线程异常已兜底: {}", t.getMessage(), t);
+            } finally {
+                bodyHandle.close();
+                if (requestId != null) ModelRequestTracker.getInstance().removeRequest(requestId);
+                if (connection != null) {
+                    connection.disconnect();
+                }
+                synchronized (this.channelConnectionMap) {
+                    this.channelConnectionMap.remove(ctx);
+                }
+            }
+        });
+    }
+
+    private AnthropicTopLevelIndexer.IndexResult readAnthropicTopLevelIndex(HttpRequestBodyHandle bodyHandle) throws IOException {
+        try (java.io.InputStream is = bodyHandle.openInputStream()) {
+            return this.topLevelIndexer.index(is);
+        }
+    }
+
+    private void handleMessagesLegacy(ChannelHandlerContext ctx, FullHttpRequest request, HttpRequestBodyHandle bodyHandle, AnthropicTopLevelIndexer.IndexResult index) throws IOException {
+        try (bodyHandle) {
+            String content = bodyHandle.readUtf8();
+            JsonObject anthropicReq;
+            try {
+                anthropicReq = gson.fromJson(content, JsonObject.class);
+            } catch (Exception e) {
+                this.sendError(ctx, HttpResponseStatus.BAD_REQUEST, "Invalid JSON body");
+                return;
+            }
+
+            JsonObject oaiReq = this.convertAnthropicToOai(anthropicReq);
+            ParamTool.handleThinking(oaiReq);
+            ChatTemplateKwargsService.getInstance().handleOpenAI(oaiReq);
+            ModelSamplingService.getInstance().handleOpenAI(oaiReq);
+
+            String nodeId = index.getNodeId();
+            if ((nodeId == null || nodeId.isBlank()) && anthropicReq.has("nodeId")) {
+                nodeId = JsonUtil.getJsonString(anthropicReq, "nodeId", null);
+            }
+
+            String modelName;
+            LlamaServerManager manager = LlamaServerManager.getInstance();
+            if (oaiReq.has("model")) {
+                modelName = oaiReq.get("model").getAsString();
+            } else {
+                modelName = manager.getFirstModelName();
+                if (modelName == null) {
+                    this.sendError(ctx, HttpResponseStatus.NOT_FOUND, "No models loaded");
+                    return;
+                }
+            }
+
+            boolean isStream = index.getStream() != null ? index.getStream().booleanValue() : false;
+            if (oaiReq.has("stream") && oaiReq.get("stream").isJsonPrimitive()) {
+                try {
+                    isStream = oaiReq.get("stream").getAsBoolean();
+                } catch (Exception ignore) {}
+            }
+
+            if (nodeId != null && !nodeId.isBlank()) {
+                oaiReq.remove("nodeId");
+                this.routeMessagesToNode(ctx, request, oaiReq, nodeId);
+                return;
+            }
+
+            if (!manager.getLoadedProcesses().containsKey(modelName)) {
+                String resolved = manager.findModelIdByAlias(modelName);
+                if (resolved != null) {
+                    modelName = resolved;
+                }
+            }
+            if (manager.getLoadedProcesses().containsKey(modelName)) {
+                Integer port = manager.getModelPort(modelName);
+                if (port == null) {
+                    this.sendError(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, "Model port not found for " + modelName);
+                    return;
+                }
+                String targetUrl = String.format("http://localhost:%d/v1/chat/completions", port.intValue());
+                this.forwardMessagesToChatCompletions(ctx, request, JsonUtil.toJson(oaiReq), targetUrl, null, isStream, modelName);
+                return;
+            }
+
+            if (manager.getLoadedProcesses().size() == 1) {
+                modelName = manager.getFirstModelName();
+                Integer port = manager.getModelPort(modelName);
+                if (port != null) {
+                    String targetUrl = String.format("http://localhost:%d/v1/chat/completions", port.intValue());
+                    this.forwardMessagesToChatCompletions(ctx, request, JsonUtil.toJson(oaiReq), targetUrl, null, isStream, modelName);
+                    return;
+                }
+            }
+
+            String[] remoteResult = resolveModelOnRemoteNodes(modelName);
+            if (remoteResult != null) {
+                this.forwardMessagesToChatCompletions(ctx, request, JsonUtil.toJson(oaiReq), remoteResult[0], remoteResult[1], isStream, modelName);
+                return;
+            }
+
+            this.sendError(ctx, HttpResponseStatus.NOT_FOUND, "Model not found: " + modelName);
+        }
+    }
+
+    private String resolveLocalAnthropicModel(String requestedModelName, LlamaServerManager manager) {
+        if (manager == null) {
+            return null;
+        }
+        String candidate = requestedModelName;
+        if (candidate != null) {
+            candidate = candidate.trim();
+        }
+        if (candidate == null || candidate.isEmpty()) {
+            if (manager.getLoadedProcesses().size() == 1) {
+                return manager.getFirstModelName();
+            }
+            return null;
+        }
+        if (manager.getLoadedProcesses().containsKey(candidate)) {
+            return candidate;
+        }
+        String alias = manager.findModelIdByAlias(candidate);
+        if (alias != null && manager.getLoadedProcesses().containsKey(alias)) {
+            return alias;
+        }
+        if (manager.getLoadedProcesses().size() == 1) {
+            return manager.getFirstModelName();
+        }
+        return null;
+    }
+
+    private Map<String, JsonElement> buildNativeAnthropicOverrides(String modelName, HttpRequestBodyHandle bodyHandle, AnthropicTopLevelIndexer.IndexResult index) throws IOException {
+        Map<String, JsonElement> overrides = new LinkedHashMap<>();
+        JsonObject patchContext = new JsonObject();
+        patchContext.addProperty("model", modelName);
+
+        JsonElement existingChatTemplateKwargs = this.readTopLevelElement(bodyHandle, index, "chat_template_kwargs");
+        if (existingChatTemplateKwargs != null && existingChatTemplateKwargs.isJsonObject()) {
+            patchContext.add("chat_template_kwargs", existingChatTemplateKwargs.deepCopy());
+        }
+
+        JsonElement existingThinking = this.readTopLevelElement(bodyHandle, index, "thinking");
+        if (existingThinking != null) {
+            patchContext.add("thinking", existingThinking.deepCopy());
+        }
+
+        JsonElement existingEnableThinking = this.readTopLevelElement(bodyHandle, index, "enable_thinking");
+        if (existingEnableThinking != null) {
+            patchContext.add("enable_thinking", existingEnableThinking.deepCopy());
+        }
+
+        JsonObject configuredKwargs = ChatTemplateKwargsService.getInstance().getOpenAIChatTemplateKwargs(modelName);
+        if (configuredKwargs != null && configuredKwargs.size() > 0) {
+            JsonObject mergedKwargs = patchContext.has("chat_template_kwargs") && patchContext.get("chat_template_kwargs").isJsonObject()
+                    ? patchContext.getAsJsonObject("chat_template_kwargs")
+                    : new JsonObject();
+            this.mergeJsonObject(mergedKwargs, configuredKwargs);
+            patchContext.add("chat_template_kwargs", mergedKwargs);
+        }
+
+        JsonObject sampling = ModelSamplingService.getInstance().getOpenAISampling(modelName);
+        if (sampling != null) {
+            for (Map.Entry<String, JsonElement> entry : sampling.entrySet()) {
+                String key = entry.getKey();
+                JsonElement value = entry.getValue();
+                if (key == null || value == null || value.isJsonNull()) {
+                    continue;
+                }
+                if ("enable_thinking".equals(key) || "force_enable_thinking".equals(key)) {
+                    continue;
+                }
+                overrides.put(key, value.deepCopy());
+            }
+            Boolean enableThinking = this.readSamplingEnableThinking(sampling);
+            if (enableThinking != null) {
+                patchContext.addProperty("enable_thinking", enableThinking.booleanValue());
+            }
+        }
+
+        ParamTool.handleOpenAIChatThinking(patchContext);
+        patchContext.remove("enable_thinking");
+        patchContext.remove("model");
+        patchContext.remove("thinking");
+
+        overrides.put("model", JsonParser.parseString(JsonUtil.toJson(modelName)));
+        if (patchContext.has("chat_template_kwargs") && patchContext.get("chat_template_kwargs").isJsonObject()
+                && patchContext.getAsJsonObject("chat_template_kwargs").size() > 0) {
+            overrides.put("chat_template_kwargs", patchContext.get("chat_template_kwargs").deepCopy());
+        }
+        return overrides;
+    }
+
+    private JsonElement readTopLevelElement(HttpRequestBodyHandle bodyHandle, AnthropicTopLevelIndexer.IndexResult index, String fieldName) throws IOException {
+        AnthropicTopLevelIndexer.JsonMemberRange memberRange = index.getMember(fieldName);
+        if (memberRange == null) {
+            return null;
+        }
+        String valueJson = bodyHandle.readUtf8Range(memberRange.getValueStart(), memberRange.getValueEnd());
+        if (valueJson == null || valueJson.isBlank()) {
+            return null;
+        }
+        try {
+            return JsonParser.parseString(valueJson);
+        } catch (Exception e) {
+            throw new IOException("Failed to parse top-level field: " + fieldName, e);
+        }
+    }
+
+    private void mergeJsonObject(JsonObject target, JsonObject source) {
+        if (target == null || source == null) {
+            return;
+        }
+        for (Map.Entry<String, JsonElement> entry : source.entrySet()) {
+            String key = entry.getKey();
+            JsonElement value = entry.getValue();
+            if (key == null || value == null || value.isJsonNull()) {
+                continue;
+            }
+            target.add(key, value.deepCopy());
+        }
+    }
+
+    private Boolean readSamplingEnableThinking(JsonObject sampling) {
+        if (sampling == null) {
+            return null;
+        }
+        JsonElement forceElement = sampling.get("force_enable_thinking");
+        Boolean force = this.readLenientBoolean(forceElement);
+        JsonElement enableElement = sampling.get("enable_thinking");
+        Boolean enable = this.readLenientBoolean(enableElement);
+        if (Boolean.FALSE.equals(force) && enable == null) {
+            return null;
+        }
+        return enable;
+    }
+
+    private Boolean readLenientBoolean(JsonElement element) {
+        if (element == null || element.isJsonNull() || !element.isJsonPrimitive()) {
+            return null;
+        }
+        try {
+            if (element.getAsJsonPrimitive().isBoolean()) {
+                return element.getAsBoolean();
+            }
+            if (element.getAsJsonPrimitive().isString()) {
+                return Boolean.parseBoolean(element.getAsString().trim());
+            }
+        } catch (Exception ignore) {
+        }
+        return null;
     }
 
     private void routeMessagesToNode(ChannelHandlerContext ctx, FullHttpRequest request, JsonObject oaiReq, String nodeId) {
@@ -1609,6 +1891,11 @@ public class AnthropicService {
         } catch (Exception ignore) {
             return null;
         }
+    }
+
+    @FunctionalInterface
+    private interface RequestBodyWriter {
+        void write(OutputStream outputStream) throws IOException;
     }
 
     private int getInt(JsonObject obj, String key, int fallback) {
